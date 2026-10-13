@@ -48,3 +48,4 @@ htmlcov/
 *.swo
 *~
 .DS_Store
+plan.md
