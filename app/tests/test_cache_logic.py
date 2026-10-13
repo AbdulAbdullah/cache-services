@@ -1,7 +1,9 @@
 """Unit tests for Stage 3 business logic, transformer, and caching services."""
+from unittest.mock import AsyncMock, patch
+
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlmodel import SQLModel, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import select
 
 from app.models.payload import Payload
 from app.models.transform_cache import TransformCache
@@ -14,24 +16,6 @@ from app.services.payload_service import (
     transform_and_cache_strings,
 )
 from app.services.transformer import transform_string, transform_strings
-
-
-@pytest.fixture
-async def test_session():
-    """Create an in-memory SQLite async database session for isolated testing."""
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
-    async with engine.begin() as conn:
-        await conn.run_sync(SQLModel.metadata.create_all)
-
-    session_maker = async_sessionmaker(
-        bind=engine,
-        class_=AsyncSession,
-        expire_on_commit=False,
-    )
-    async with session_maker() as session:
-        yield session
-
-    await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -122,3 +106,43 @@ async def test_process_payload_fresh_and_deduplication(test_session: AsyncSessio
     result = await test_session.execute(select(Payload))
     all_payloads = result.scalars().all()
     assert len(all_payloads) == 1
+
+
+@pytest.mark.asyncio
+async def test_minimizes_transformer_calls_via_cache(test_session: AsyncSession):
+    """Verify that transform_string is only called for uncached strings."""
+    with patch("app.services.payload_service.transform_string", wraps=transform_string) as mock_transform:
+        # First call with 3 strings
+        res1 = await transform_and_cache_strings(test_session, ["one", "two", "three"], delay=0)
+        assert res1 == {"one": "ONE", "two": "TWO", "three": "THREE"}
+        assert mock_transform.call_count == 3
+
+        mock_transform.reset_mock()
+
+        # Second call with 2 already cached + 1 new string
+        res2 = await transform_and_cache_strings(test_session, ["two", "three", "four"], delay=0)
+        assert res2 == {"two": "TWO", "three": "THREE", "four": "FOUR"}
+        assert mock_transform.call_count == 1
+        assert mock_transform.call_args[0][0] == "four"
+
+        mock_transform.reset_mock()
+
+        # Third call with completely cached strings
+        res3 = await transform_and_cache_strings(test_session, ["one", "two"], delay=0)
+        assert res3 == {"one": "ONE", "two": "TWO"}
+        # Transformer should not be called at all
+        assert mock_transform.call_count == 0
+
+
+def test_interleave_strings_empty():
+    """Verify interleaving empty lists produces empty list and empty string."""
+    interleaved = interleave_strings([], [])
+    assert interleaved == []
+    assert format_interleaved_output(interleaved) == ""
+
+
+def test_interleave_strings_single():
+    """Verify interleaving single-item lists."""
+    interleaved = interleave_strings(["only_first"], ["only_second"])
+    assert interleaved == ["only_first", "only_second"]
+    assert format_interleaved_output(interleaved) == "only_first only_second"

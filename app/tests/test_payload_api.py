@@ -1,38 +1,10 @@
 """Integration tests for FastAPI endpoints (POST /payload, GET /payload/{id}, /health)."""
+from unittest.mock import patch
+
 import pytest
-from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlmodel import SQLModel
+from httpx import AsyncClient
 
-from app.core.database import get_session
-from app.main import app
-
-
-@pytest.fixture
-async def test_client():
-    """Create a test client with an isolated in-memory SQLite database."""
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
-    async with engine.begin() as conn:
-        await conn.run_sync(SQLModel.metadata.create_all)
-
-    session_maker = async_sessionmaker(
-        bind=engine,
-        class_=AsyncSession,
-        expire_on_commit=False,
-    )
-
-    async def override_get_session():
-        async with session_maker() as session:
-            yield session
-
-    app.dependency_overrides[get_session] = override_get_session
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        yield client
-
-    app.dependency_overrides.clear()
-    await engine.dispose()
+from app.services.transformer import transform_string
 
 
 @pytest.mark.asyncio
@@ -56,6 +28,7 @@ async def test_create_and_get_payload(test_client: AsyncClient):
     assert post_res.status_code == 201
     res_json = post_res.json()
     assert "id" in res_json
+    assert isinstance(res_json["id"], int)
     payload_id = res_json["id"]
 
     # 2. GET /payload/{id}
@@ -94,6 +67,27 @@ async def test_payload_deduplication(test_client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_cross_request_string_level_caching(test_client: AsyncClient):
+    """Verify string caching is shared across different payloads."""
+    with patch("app.services.payload_service.transform_string", wraps=transform_string) as mock_transform:
+        # Request 1 has "cat" and "dog"
+        req1 = {"list_1": ["cat"], "list_2": ["dog"]}
+        res1 = await test_client.post("/payload", json=req1)
+        assert res1.status_code == 201
+        assert mock_transform.call_count == 2
+
+        mock_transform.reset_mock()
+
+        # Request 2 shares "dog" and adds "bird"
+        req2 = {"list_1": ["dog"], "list_2": ["bird"]}
+        res2 = await test_client.post("/payload", json=req2)
+        assert res2.status_code == 201
+        # Only "bird" should trigger a transformer call
+        assert mock_transform.call_count == 1
+        assert mock_transform.call_args[0][0] == "bird"
+
+
+@pytest.mark.asyncio
 async def test_create_payload_unequal_lengths(test_client: AsyncClient):
     """Verify 422 error when list_1 and list_2 have different lengths."""
     payload_data = {
@@ -118,3 +112,16 @@ async def test_get_nonexistent_payload(test_client: AsyncClient):
     response = await test_client.get("/payload/99999")
     assert response.status_code == 404
     assert response.json()["detail"] == "Payload not found"
+
+
+@pytest.mark.asyncio
+async def test_create_payload_empty_lists(test_client: AsyncClient):
+    """Verify creating a payload with empty lists succeeds."""
+    payload_data = {"list_1": [], "list_2": []}
+    post_res = await test_client.post("/payload", json=payload_data)
+    assert post_res.status_code == 201
+    payload_id = post_res.json()["id"]
+
+    get_res = await test_client.get(f"/payload/{payload_id}")
+    assert get_res.status_code == 200
+    assert get_res.json()["output"] == ""
